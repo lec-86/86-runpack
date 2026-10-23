@@ -1,0 +1,11 @@
+# 运行库安装包缓存：体积大（数百 MB）且均为微软官方分发文件，不入库。
+# 程序首次联网运行时会下载到 exe 同级的 packages 目录，之后离线复用。
+/packages/
+
+# 编译产物（发布请走 GitHub Releases，不提交进仓库）
+_build_out.exe
+*.exe
+
+# 界面进程与提权工作进程之间的临时通信文件
+*.status
+*.cancel
