@@ -1,14 +1,6 @@
-// ============================================================================
-//  86 运行库
-//  ---------------------------------------------------------------------------
-//  一个零依赖的 Windows 原生程序（面向 Windows 10 / 11）：列出全部主流
-//  C++ / .NET 运行库及其它常用运行库，自动检测本机安装状态，支持勾选后一键
-//  静默安装。安装包首次运行从微软（及 Java/OpenAL/Vulkan 官方）服务器下载，
-//  保存在程序同目录的 packages 文件夹内，之后可离线复用。
-//
-//  编译： csc.exe /target:winexe /codepage:65001 /win32icon:app.ico ...
-//  自检： 86运行库.exe /selftest [报告文件]
-// ============================================================================
+﻿// ---------------------------------------------------------------------------
+//  Part of the 86 RuntimePack sources: main window (MainForm)
+// ---------------------------------------------------------------------------
 
 using System;
 using System.Collections.Generic;
@@ -18,6 +10,8 @@ using System.Drawing;
 using System.IO;
 using System.IO.Compression;
 using System.Net;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
@@ -26,1042 +20,6 @@ using Microsoft.Win32;
 
 namespace RunTimePack
 {
-    // ======================= 数据模型 =======================
-
-    internal enum InstallKind
-    {
-        Exe,        // 普通 exe，带静默参数直接运行
-        Msi,        // 走 msiexec 安装
-        Dism,       // Windows 功能（.NET Framework 3.5）
-        DirectX,    // 先自解压，再运行 DXSETUP.exe /silent
-        Zip,        // 解压后运行包内 exe
-        DllRepair   // 体检并补齐系统目录中缺失的运行库 DLL（从本机 WinSxS 取文件）
-    }
-
-    internal class Pkg
-    {
-        public string Category;
-        public string Name;
-        public string Note;          // 版本 / 说明
-        public string Url;
-        public string FileName;      // 本地保存名（也用于离线包匹配）
-        public InstallKind Kind;
-        public string Args;          // 静默安装参数
-        public string DetectKind;
-        public string DetectArg;
-        public long SizeHint;        // 大致体积，仅用于展示
-        public bool Recommended;     // 是否属于“推荐一键安装”集合
-        public bool X64Only;         // 仅 64 位系统适用
-
-        public string InnerExe;      // Zip 类型：压缩包内要运行的 exe
-        public string InnerArgs;
-
-        // 运行时状态
-        public ListViewItem Item;
-        public bool Installed;
-        public bool Applicable = true;
-        public bool Selected;            // 勾选状态以这里为准（不能直接读 ListViewItem.Checked，见 UpdateTabTitles 的说明）
-        public string StatusText = "等待检测";
-
-        public Pkg(string category, string name, string note, string url, string fileName,
-                   InstallKind kind, string args, string detectKind, string detectArg,
-                   long sizeHint, bool recommended, bool x64Only)
-        {
-            Category = category;
-            Name = name;
-            Note = note;
-            Url = url;
-            FileName = fileName;
-            Kind = kind;
-            Args = args;
-            DetectKind = detectKind;
-            DetectArg = detectArg;
-            SizeHint = sizeHint;
-            Recommended = recommended;
-            X64Only = x64Only;
-        }
-
-        public string SizeText
-        {
-            get
-            {
-                if (SizeHint <= 0) return "体积未知";
-                if (SizeHint >= 1024L * 1024L)
-                    return string.Format("{0:0.#} MB", SizeHint / (1024.0 * 1024.0));
-                return string.Format("{0:0.#} KB", SizeHint / 1024.0);
-            }
-        }
-
-        /// <summary>
-        /// "修复模式"参数：当运行库本身已安装、但系统目录里少了某个 DLL 时，
-        /// 重复 /install 会被安装器判定为"已安装"而什么都不做（文件仍然缺失），
-        /// 必须改用 /repair 让 Windows Installer 还原缺失组件。
-        /// 仅对使用 /install 静默参数的安装器（VC++ 2012 / 2013 / v14）自动推导。
-        /// </summary>
-        public string RepairArgs
-        {
-            get
-            {
-                if (Kind != InstallKind.Exe) return null;
-                if (Args == null) return null;
-                if (Args.IndexOf("/install", StringComparison.OrdinalIgnoreCase) < 0) return null;
-                return Args.Replace("/install", "/repair");
-            }
-        }
-    }
-
-    // ======================= 运行库清单 =======================
-    //  所有下载地址均为官方地址，且均已逐一验证可访问。
-    internal static class Catalog
-    {
-        public const string CAT_VC     = "Microsoft Visual C++ 运行库";
-        public const string CAT_NET    = ".NET 运行库";
-        public const string CAT_GAME   = "游戏 & 经典运行库";
-        public const string CAT_OTHER  = "其他常用运行库";
-        public const string CAT_REPAIR = "系统组件修复";
-
-        private const string DM = "https://download.microsoft.com/download/";
-
-        public static List<Pkg> Build()
-        {
-            List<Pkg> list = new List<Pkg>();
-            const InstallKind E = InstallKind.Exe;
-
-            // ---------- Visual C++ ----------
-            // 2005/2008 的安装包是自解压程序，需把 msi 再交给 msiexec 才能完全静默
-            const string OLD_ARGS = "/q:a /c:\"msiexec /i vcredist.msi /qn /norestart\"";
-
-            list.Add(new Pkg(CAT_VC, "Visual C++ 2005 SP1 (x86)", "8.0.61001", DM + "8/B/4/8B42259F-5D70-43F4-AC2E-4B208FD8D66A/vcredist_x86.exe", "vcredist_2005_x86.exe", E, OLD_ARGS, "vcredist", "2005|x86", 2710520, true, false));
-            list.Add(new Pkg(CAT_VC, "Visual C++ 2005 SP1 (x64)", "8.0.61001", DM + "8/B/4/8B42259F-5D70-43F4-AC2E-4B208FD8D66A/vcredist_x64.exe", "vcredist_2005_x64.exe", E, OLD_ARGS, "vcredist", "2005|x64", 3179000, true, true));
-            list.Add(new Pkg(CAT_VC, "Visual C++ 2008 SP1 (x86)", "9.0.30729.5677", DM + "5/D/8/5D8C65CB-C849-4025-8E95-C3966CAFD8AE/vcredist_x86.exe", "vcredist_2008_x86.exe", E, OLD_ARGS, "vcredist", "2008|x86", 4483040, true, false));
-            list.Add(new Pkg(CAT_VC, "Visual C++ 2008 SP1 (x64)", "9.0.30729.5677", DM + "5/D/8/5D8C65CB-C849-4025-8E95-C3966CAFD8AE/vcredist_x64.exe", "vcredist_2008_x64.exe", E, OLD_ARGS, "vcredist", "2008|x64", 5211080, true, true));
-            list.Add(new Pkg(CAT_VC, "Visual C++ 2010 SP1 (x86)", "10.0.40219.325", DM + "1/6/5/165255E7-1014-4D0A-B094-B6A430A6BFFC/vcredist_x86.exe", "vcredist_2010_x86.exe", E, "/q /norestart", "vcfile", "x86|msvcr100.dll", 8993744, true, false));
-            list.Add(new Pkg(CAT_VC, "Visual C++ 2010 SP1 (x64)", "10.0.40219.325", DM + "1/6/5/165255E7-1014-4D0A-B094-B6A430A6BFFC/vcredist_x64.exe", "vcredist_2010_x64.exe", E, "/q /norestart", "vcfile", "x64|msvcr100.dll", 10277328, true, true));
-            list.Add(new Pkg(CAT_VC, "Visual C++ 2012 Update 4 (x86)", "11.0.61030.0", DM + "1/6/B/16B06F60-3B20-4FF2-B699-5E9B7962F9AE/VSU_4/vcredist_x86.exe", "vcredist_2012_x86.exe", E, "/install /quiet /norestart", "vcfile", "x86|msvcr110.dll", 6554576, true, false));
-            list.Add(new Pkg(CAT_VC, "Visual C++ 2012 Update 4 (x64)", "11.0.61030.0", DM + "1/6/B/16B06F60-3B20-4FF2-B699-5E9B7962F9AE/VSU_4/vcredist_x64.exe", "vcredist_2012_x64.exe", E, "/install /quiet /norestart", "vcfile", "x64|msvcr110.dll", 7186992, true, true));
-            list.Add(new Pkg(CAT_VC, "Visual C++ 2013 (x86)", "12.0.40664.0", "https://aka.ms/highdpimfc2013x86enu", "vcredist_2013_x86.exe", E, "/install /quiet /norestart", "vcfile", "x86|msvcr120.dll", 6510136, true, false));
-            list.Add(new Pkg(CAT_VC, "Visual C++ 2013 (x64)", "12.0.40664.0", "https://aka.ms/highdpimfc2013x64enu", "vcredist_2013_x64.exe", E, "/install /quiet /norestart", "vcfile", "x64|msvcr120.dll", 7200744, true, true));
-            list.Add(new Pkg(CAT_VC, "Visual C++ 2015-2026 (x86)", "v14 最新版（VS2017-2026 通用）", "https://aka.ms/vs/17/release/vc_redist.x86.exe", "vcredist_2015-2022_x86.exe", E, "/install /quiet /norestart", "vc14", "x86", 13953392, true, false));
-            list.Add(new Pkg(CAT_VC, "Visual C++ 2015-2026 (x64)", "v14 最新版（VS2017-2026 通用）", "https://aka.ms/vs/17/release/vc_redist.x64.exe", "vcredist_2015-2022_x64.exe", E, "/install /quiet /norestart", "vc14", "x64", 25635768, true, true));
-
-            // ---------- .NET ----------
-            list.Add(new Pkg(CAT_NET, ".NET Framework 3.5 (含 2.0/3.0)", "系统功能，走 DISM 启用", "", "", InstallKind.Dism, "", "net35", "", 0, true, false));
-            list.Add(new Pkg(CAT_NET, ".NET Framework 4.8", "4.8.0.0", "https://go.microsoft.com/fwlink/?linkid=2088631", "ndp48_x86_x64.exe", E, "/q /norestart", "net48", "", 121346568, true, false));
-
-            list.Add(new Pkg(CAT_NET, ".NET Desktop Runtime 6.0 (x64)", "6.0 LTS", "https://aka.ms/dotnet/6.0/windowsdesktop-runtime-win-x64.exe", "windowsdesktop-runtime-6.0-x64.exe", E, "/install /quiet /norestart", "sharedfx", "Microsoft.WindowsDesktop.App|6", 57380656, false, true));
-            list.Add(new Pkg(CAT_NET, ".NET Desktop Runtime 7.0 (x64)", "7.0", "https://aka.ms/dotnet/7.0/windowsdesktop-runtime-win-x64.exe", "windowsdesktop-runtime-7.0-x64.exe", E, "/install /quiet /norestart", "sharedfx", "Microsoft.WindowsDesktop.App|7", 58011208, false, true));
-            list.Add(new Pkg(CAT_NET, ".NET Desktop Runtime 8.0 (x64)", "8.0 LTS", "https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe", "windowsdesktop-runtime-8.0-x64.exe", E, "/install /quiet /norestart", "sharedfx", "Microsoft.WindowsDesktop.App|8", 58715896, true, true));
-            list.Add(new Pkg(CAT_NET, ".NET Desktop Runtime 8.0 (x86)", "8.0 LTS", "https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x86.exe", "windowsdesktop-runtime-8.0-x86.exe", E, "/install /quiet /norestart", "sharedfx", "Microsoft.WindowsDesktop.App|8|x86", 53761616, false, false));
-            list.Add(new Pkg(CAT_NET, ".NET Desktop Runtime 9.0 (x64)", "9.0", "https://aka.ms/dotnet/9.0/windowsdesktop-runtime-win-x64.exe", "windowsdesktop-runtime-9.0-x64.exe", E, "/install /quiet /norestart", "sharedfx", "Microsoft.WindowsDesktop.App|9", 60851384, false, true));
-            list.Add(new Pkg(CAT_NET, ".NET Desktop Runtime 10.0 (x64)", "10.0 LTS", "https://aka.ms/dotnet/10.0/windowsdesktop-runtime-win-x64.exe", "windowsdesktop-runtime-10.0-x64.exe", E, "/install /quiet /norestart", "sharedfx", "Microsoft.WindowsDesktop.App|10", 60032984, false, true));
-            list.Add(new Pkg(CAT_NET, "ASP.NET Core Runtime 8.0 (x64)", "8.0 LTS", "https://aka.ms/dotnet/8.0/aspnetcore-runtime-win-x64.exe", "aspnetcore-runtime-8.0-x64.exe", E, "/install /quiet /norestart", "sharedfx", "Microsoft.AspNetCore.App|8", 10505248, false, true));
-            list.Add(new Pkg(CAT_NET, "ASP.NET Core Runtime 9.0 (x64)", "9.0", "https://aka.ms/dotnet/9.0/aspnetcore-runtime-win-x64.exe", "aspnetcore-runtime-9.0-x64.exe", E, "/install /quiet /norestart", "sharedfx", "Microsoft.AspNetCore.App|9", 10679120, false, true));
-
-            // ---------- 游戏 & 经典运行库 ----------
-            // XNA / J# 均为 32 位运行库，安装包本身同时带 x86/x64 组件，故不分架构列条目
-            list.Add(new Pkg(CAT_GAME, "XNA Framework 3.1", "老游戏常用（XNA 3.1 游戏）",
-                DM + "5/9/1/5912526c-b950-4662-99b6-119a83e60e5c/xnafx31_redist.msi",
-                "xnafx31_redist.msi", InstallKind.Msi, "/qn /norestart", "xna", "3.1", 7672320, false, false));
-
-            list.Add(new Pkg(CAT_GAME, "XNA Framework 4.0 Refresh", "老游戏常用（星露谷等）",
-                DM + "5/3/A/53A804C8-EC78-43CD-A0F0-2FB4D45603D3/xnafx40_redist.msi",
-                "xnafx40_redist.msi", InstallKind.Msi, "/qn /norestart", "xna", "4.0", 7059456, false, false));
-
-            list.Add(new Pkg(CAT_GAME, "Visual J# 2.0 运行库", "J# 编写的老程序 / 老游戏",
-                DM + "9/a/0/9a01eb1e-fe80-41af-a3f8-ea41220918f7/vjredist.exe",
-                "vjredist.exe", E, "/q", "vjsharp", "", 3798912, false, false));
-
-            // ---------- 其他常用运行库 ----------
-            list.Add(new Pkg(CAT_OTHER, "DirectX 9.0c 运行库", "2010 年 6 月版", DM + "8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe", "directx_Jun2010_redist.exe", InstallKind.DirectX, "", "vcfile", "both|d3dx9_43.dll", 100275120, true, false));
-            list.Add(new Pkg(CAT_OTHER, "Microsoft Edge WebView2 Runtime", "常青版引导程序", "https://go.microsoft.com/fwlink/p/?LinkId=2124703", "MicrosoftEdgeWebview2Setup.exe", E, "/silent /install", "webview2", "", 1850576, true, false));
-
-            Pkg jre8 = new Pkg(CAT_OTHER, "Java 运行环境 JRE 8 (Eclipse Temurin)", "8 (x64)", "https://api.adoptium.net/v3/installer/latest/8/ga/windows/x64/jre/hotspot/normal/eclipse", "temurin-jre8-x64.msi", InstallKind.Msi, "/qn /norestart", "java", "8", 32010240, false, true);
-            list.Add(jre8);
-
-            Pkg jre21 = new Pkg(CAT_OTHER, "Java 运行环境 JRE 21 (Eclipse Temurin)", "21 LTS", "https://api.adoptium.net/v3/installer/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse", "temurin-jre21-x64.msi", InstallKind.Msi, "/qn /norestart", "java", "21", 34963456, false, true);
-            list.Add(jre21);
-
-            Pkg openal = new Pkg(CAT_OTHER, "OpenAL 1.1 音频运行库", "老游戏常用", "https://www.openal.org/downloads/oalinst.zip", "oalinst.zip", InstallKind.Zip, "", "vcfile", "both|OpenAL32.dll", 590434, false, false);
-            openal.InnerExe = "oalinst.exe";
-            openal.InnerArgs = "/s";
-            list.Add(openal);
-
-            list.Add(new Pkg(CAT_OTHER, "Vulkan Runtime 运行库", "图形 API 运行时", "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-runtime.exe", "vulkan-runtime.exe", E, "/S", "vcfile", "both|vulkan-1.dll", 25699768, false, false));
-
-            list.Add(new Pkg(CAT_OTHER, "Visual Studio 2010 Tools for Office Runtime", "VSTO 4.0，Office 插件依赖",
-                DM + "8/6/4/8641e164-7796-4b34-81c7-30d24a5bd533/vstor_redist.exe",
-                "vstor_redist.exe", E, "/quiet /norestart", "vsto", "", 41649696, false, false));
-
-            // ---------- 系统组件修复 ----------
-            list.Add(new Pkg(CAT_REPAIR, "补充 / 修复系统运行库 DLL（含 DirectX）",
-                "体检 " + DllCatalog.Items.Count + " 种 DLL（DirectX / VC++ / MFC / 系统组件），共 "
-                + Sys.TotalChecks + " 项，缺失即就地补齐或自动安装归属运行库",
-                "", "", InstallKind.DllRepair, "", "dllrepair", "", 0, false, false));
-
-            return list;
-        }
-    }
-
-    // ======================= 运行库 DLL 体检清单 =======================
-    //  对照 DirectX 修复工具的做法，把"常见缺失的运行库 DLL"整理成一张清单，
-    //  逐项体检系统目录（System32 / SysWOW64），缺失的就地补齐。
-    //
-    //  DirectX 部分的 92 个名称，是把微软官方 directx_Jun2010_redist.exe 解包后
-    //  逐个 CAB 展开、按实际内容清点出来的，不是凭印象编的。
-    //  每一项都带有"归属运行库"：本机找不到现成副本时，就自动下载并静默安装它。
-
-    internal static class DllCatalog
-    {
-        public const string G_DX  = "DirectX 组件";
-        public const string G_CRT = "VC++ 运行库";
-        public const string G_MFC = "MFC / ATL";
-        public const string G_SYS = "系统组件";
-
-        internal class Item
-        {
-            public string Name;    // DLL 文件名（小写）
-            public string Group;   // 分组，仅用于统计展示
-            public string Owner;   // 归属运行库代号，见 OwnerFile()
-            public bool X64Only;   // 只有 64 位版本，32 位副本永不存在，不参与 x86 体检
-
-            public Item(string name, string group, string owner)
-            {
-                Name = name;
-                Group = group;
-                Owner = owner;
-            }
-        }
-
-        public static readonly List<Item> Items = Build();
-
-        private static List<Item> Build()
-        {
-            List<Item> l = new List<Item>();
-
-            // ---- DirectX 9.0c 组件（2010 年 6 月版，共 92 个）----
-            Range(l, G_DX, "directx", "d3dcompiler_", 33, 43);
-            Range(l, G_DX, "directx", "d3dcsx_", 42, 43);
-            l.Add(new Item("d3dx10.dll", G_DX, "directx"));
-            Range(l, G_DX, "directx", "d3dx10_", 33, 43);
-            Range(l, G_DX, "directx", "d3dx11_", 42, 43);
-            Range(l, G_DX, "directx", "d3dx9_", 24, 43);
-            Range(l, G_DX, "directx", "x3daudio1_", 0, 7);
-            Range(l, G_DX, "directx", "xactengine2_", 0, 10);
-            Range(l, G_DX, "directx", "xactengine3_", 0, 7);
-            Range(l, G_DX, "directx", "xapofx1_", 0, 5);
-            Range(l, G_DX, "directx", "xaudio2_", 0, 7);
-            Range(l, G_DX, "directx", "xinput1_", 1, 3);
-            l.Add(new Item("xinput9_1_0.dll", G_DX, "directx"));
-
-            // ---- VC++ 运行库 ----
-            l.Add(new Item("msvcr80.dll", G_CRT, "2005"));
-            l.Add(new Item("msvcp80.dll", G_CRT, "2005"));
-            l.Add(new Item("msvcr90.dll", G_CRT, "2008"));
-            l.Add(new Item("msvcp90.dll", G_CRT, "2008"));
-            l.Add(new Item("msvcr100.dll", G_CRT, "2010"));
-            l.Add(new Item("msvcp100.dll", G_CRT, "2010"));
-            l.Add(new Item("msvcr110.dll", G_CRT, "2012"));
-            l.Add(new Item("msvcp110.dll", G_CRT, "2012"));
-            l.Add(new Item("msvcr120.dll", G_CRT, "2013"));
-            l.Add(new Item("msvcp120.dll", G_CRT, "2013"));
-            string[] v14 = new string[]
-            {
-                "vcruntime140.dll",
-                "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
-                "msvcp140_codecvt_ids.dll", "concrt140.dll", "vccorlib140.dll"
-            };
-            foreach (string n in v14) l.Add(new Item(n, G_CRT, "vc14"));
-
-            //  实测（解包官方 vcredist_2015-2022_x86.exe 的 Burn 容器，读两个 MSI 的 File 表）：
-            //    x86 Minimum Runtime 11 个文件里**没有** vcruntime140_1.dll；
-            //    x64 / arm64 Minimum Runtime 才有该文件。
-            //  即微软从未发布 32 位版 vcruntime140_1.dll，官方任何安装包都补不出它，
-            //  与 atl140.dll 同属"永远补不上"的假缺口，故标记为仅 64 位、不参与 x86 体检。
-            Item vcr1401 = new Item("vcruntime140_1.dll", G_CRT, "vc14");
-            vcr1401.X64Only = true;
-            l.Add(vcr1401);
-
-            // ---- MFC（VC++ 2015-2026 起随 vc_redist 一起安装）----
-            //  注意：ATL 自 v14 起是纯头文件，不再分发 atl140.dll，
-            //  连完整安装的机器上也没有该文件，故不列入清单（否则会永远报"缺失"）。
-            string[] mfc = new string[]
-            {
-                "mfc140.dll", "mfc140u.dll", "mfcm140.dll", "mfcm140u.dll"
-            };
-            foreach (string n in mfc) l.Add(new Item(n, G_MFC, "vc14"));
-
-            // ---- 系统自带组件（正常情况下一定存在，缺失时从 WinSxS 取）----
-            l.Add(new Item("msvcrt.dll", G_SYS, null));
-            l.Add(new Item("msvcirt.dll", G_SYS, null));
-
-            return l;
-        }
-
-        private static void Range(List<Item> l, string group, string owner, string prefix, int from, int to)
-        {
-            for (int i = from; i <= to; i++) l.Add(new Item(prefix + i + ".dll", group, owner));
-        }
-
-        /// <summary>归属运行库代号 → 运行库清单里的安装包文件名（离线包名）。</summary>
-        public static string OwnerFile(string owner, bool x64)
-        {
-            switch (owner)
-            {
-                case "directx": return "directx_Jun2010_redist.exe";
-                case "2005":    return x64 ? "vcredist_2005_x64.exe" : "vcredist_2005_x86.exe";
-                case "2008":    return x64 ? "vcredist_2008_x64.exe" : "vcredist_2008_x86.exe";
-                case "2010":    return x64 ? "vcredist_2010_x64.exe" : "vcredist_2010_x86.exe";
-                case "2012":    return x64 ? "vcredist_2012_x64.exe" : "vcredist_2012_x86.exe";
-                case "2013":    return x64 ? "vcredist_2013_x64.exe" : "vcredist_2013_x86.exe";
-                case "vc14":    return x64 ? "vcredist_2015-2022_x64.exe" : "vcredist_2015-2022_x86.exe";
-            }
-            return null;
-        }
-
-        /// <summary>按分组统计。</summary>
-        public static List<string> Groups()
-        {
-            List<string> g = new List<string>();
-            foreach (Item i in Items) if (!g.Contains(i.Group)) g.Add(i.Group);
-            return g;
-        }
-    }
-
-    // ======================= 系统目录 / WinSxS 工具 =======================
-    //  说明：64 位 Windows 上 System32 存放 64 位文件、SysWOW64 存放 32 位文件；
-    //  32 位 Windows 上只有一个 System32，存放 32 位文件。
-
-    internal static class Sys
-    {
-        public static string Windows
-        {
-            get { return Environment.GetFolderPath(Environment.SpecialFolder.Windows); }
-        }
-        public static string System32 { get { return Path.Combine(Windows, "System32"); } }
-        public static string SysWow64 { get { return Path.Combine(Windows, "SysWOW64"); } }
-        public static string WinSxS   { get { return Path.Combine(Windows, "WinSxS"); } }
-
-        /// <summary>取某架构运行库应当存放的系统目录。</summary>
-        public static string DirFor(bool x64)
-        {
-            if (x64) return System32;
-            return Environment.Is64BitOperatingSystem ? SysWow64 : System32;
-        }
-
-        private static string[] sxsDirs;
-
-        /// <summary>WinSxS 子目录只枚举一次并缓存，避免反复扫描上万个文件夹。</summary>
-        public static string[] SxsDirs()
-        {
-            if (sxsDirs == null)
-            {
-                try
-                {
-                    sxsDirs = Directory.Exists(WinSxS) ? Directory.GetDirectories(WinSxS) : new string[0];
-                }
-                catch { sxsDirs = new string[0]; }
-            }
-            return sxsDirs;
-        }
-
-        /// <summary>
-        /// 在 WinSxS 中查找指定名称、指定架构的 DLL，返回版本最高的那一份。
-        /// WinSxS 里有上万个目录，逐个全量扫描太慢，所以先用文件名推导出的关键词过滤目录名
-        /// （msvcr80.dll → vc80，d3dcompiler_43.dll → d3dcompiler），只扫描相关目录；
-        /// 命中后还要读 PE 头确认位数，避免把 32 位文件复制到 64 位目录。
-        /// </summary>
-        public static string FindInSxs(string fileName, bool x64)
-        {
-            string archPrefix = x64 ? "amd64_" : "x86_";
-            string[] hints = SxsHints(fileName);
-            string[] dirs = SxsDirs();
-            string best = null, bestDir = null;
-
-            for (int pass = 0; pass < 2; pass++)
-            {
-                foreach (string dir in dirs)
-                {
-                    string n = Path.GetFileName(dir);
-                    if ((pass == 0) != n.StartsWith(archPrefix, StringComparison.OrdinalIgnoreCase)) continue;
-                    if (!ContainsAny(n, hints)) continue;
-
-                    string f = Path.Combine(dir, fileName);
-                    if (!File.Exists(f)) continue;
-                    if (!MachineMatches(f, x64)) continue;
-
-                    // WinSxS 目录名里嵌了版本号，字典序最大即为最新
-                    if (best == null || string.CompareOrdinal(n, bestDir) > 0)
-                    {
-                        best = f;
-                        bestDir = n;
-                    }
-                }
-                if (best != null) return best;
-            }
-            return null;
-        }
-
-        private static bool ContainsAny(string text, string[] hints)
-        {
-            foreach (string h in hints)
-                if (text.IndexOf(h, StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            return false;
-        }
-
-        /// <summary>由 DLL 文件名推导 WinSxS 目录名里可能出现的关键词。</summary>
-        private static string[] SxsHints(string fileName)
-        {
-            string b = Path.GetFileNameWithoutExtension(fileName).ToLowerInvariant();
-            List<string> hints = new List<string>();
-            hints.Add(b);
-
-            int us = b.IndexOf('_');
-            if (us > 0)
-            {
-                string head = b.Substring(0, us);                       // d3dx9_43 -> d3dx9 ，xinput1_4 -> xinput1
-                hints.Add(head);
-                char[] digits = new char[] { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9' };
-                string trimmed = head.TrimEnd(digits);                  // xinput1 -> xinput
-                if (trimmed.Length >= 4) hints.Add(trimmed);
-            }
-
-            // CRT / MFC 家族：msvcr80 → vc80，mfc140u → vc140，vcruntime140 → vc140
-            string[] family = new string[]
-            {
-                "msvcr", "msvcp", "mfc", "mfcm", "atl", "vcruntime", "concrt", "vccorlib"
-            };
-            foreach (string f in family)
-            {
-                if (!b.StartsWith(f)) continue;
-                string num = "";
-                foreach (char c in b)
-                {
-                    if (c >= '0' && c <= '9') num += c;
-                    else if (num.Length > 0) break;
-                }
-                if (num.Length > 0) hints.Add("vc" + num);
-                break;
-            }
-            return hints.ToArray();
-        }
-
-        /// <summary>读取 PE 头 Machine 字段，判断该映像是否为 32 位（0x014C）或 64 位（0x8664）。</summary>
-        public static bool MachineMatches(string file, bool x64)
-        {
-            try
-            {
-                using (FileStream fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (BinaryReader br = new BinaryReader(fs))
-                {
-                    if (fs.Length < 0x40) return false;
-
-                    fs.Position = 0x3C;
-                    int pe = br.ReadInt32();
-                    if (pe <= 0 || pe + 6 > fs.Length) return false;
-
-                    fs.Position = pe;
-                    byte[] sig = br.ReadBytes(4);
-                    if (sig[0] != 0x50 || sig[1] != 0x45) return false;   // "PE"
-
-                    ushort machine = br.ReadUInt16();
-                    return x64 ? machine == 0x8664 : machine == 0x014C;
-                }
-            }
-            catch { return false; }
-        }
-
-        // ---------- 运行库 DLL 体检 ----------
-
-        /// <summary>体检总项数：清单条目数 × 架构数（64 位系统上每种架构各查一遍）。
-        /// 仅 64 位版本的文件（X64Only）不参与 32 位体检，故单独扣除。</summary>
-        public static int TotalChecks
-        {
-            get
-            {
-                bool os64 = Environment.Is64BitOperatingSystem;
-                int n = 0;
-                foreach (DllCatalog.Item item in DllCatalog.Items)
-                {
-                    if (!item.X64Only) n++;   // 32 位副本
-                    if (os64) n++;            // 64 位副本
-                }
-                return n;
-            }
-        }
-
-        /// <summary>
-        /// 扫描系统目录，返回缺失的 DLL 列表。
-        /// findSource 为 true 时（修复流程）额外去 WinSxS 找同架构副本；检测流程传 false 以保证启动速度。
-        /// </summary>
-        public static List<DllIssue> ScanRuntimeDlls(bool findSource)
-        {
-            List<DllIssue> list = new List<DllIssue>();
-            bool os64 = Environment.Is64BitOperatingSystem;
-
-            foreach (DllCatalog.Item item in DllCatalog.Items)
-            {
-                // 32 位副本（X64Only 的文件只有 64 位版本，32 位系统目录里本来就不该有）
-                if (!item.X64Only && !File.Exists(Path.Combine(DirFor(false), item.Name)))
-                    list.Add(new DllIssue(item, false, findSource ? FindInSxs(item.Name, false) : null));
-
-                // 64 位副本（仅 64 位系统才有）
-                if (os64 && !File.Exists(Path.Combine(DirFor(true), item.Name)))
-                    list.Add(new DllIssue(item, true, findSource ? FindInSxs(item.Name, true) : null));
-            }
-            return list;
-        }
-    }
-
-    /// <summary>
-    /// 一个缺失的运行库 DLL。
-    /// Source 为空表示本机 WinSxS 里也没有同架构副本，需要安装 Owner 对应的运行库来补齐。
-    /// </summary>
-    internal class DllIssue
-    {
-        public string Name;
-        public string Group;
-        public string Owner;
-        public bool X64;
-        public string Source;
-
-        public DllIssue(DllCatalog.Item item, bool x64, string source)
-        {
-            Name = item.Name;
-            Group = item.Group;
-            Owner = item.Owner;
-            X64 = x64;
-            Source = source;
-        }
-
-        public string ArchText { get { return X64 ? "64 位" : "32 位"; } }
-    }
-
-    // ======================= 安装状态检测 =======================
-
-    internal class DetectResult
-    {
-        public bool Installed;
-        public bool Applicable;
-        public string Text;
-
-        public DetectResult(bool installed, bool applicable, string text)
-        {
-            Installed = installed;
-            Applicable = applicable;
-            Text = text;
-        }
-    }
-
-    internal static class Detect
-    {
-        public static DetectResult Run(Pkg p)
-        {
-            try
-            {
-                return RunCore(p);
-            }
-            catch
-            {
-                return new DetectResult(false, true, "检测异常");
-            }
-        }
-
-        private static DetectResult RunCore(Pkg p)
-        {
-            if (p.X64Only && !Environment.Is64BitOperatingSystem)
-                return new DetectResult(false, false, "不适用（32 位系统）");
-
-            switch (p.DetectKind)
-            {
-                case "vcfile":   return SystemFile(p.DetectArg);
-                case "vcredist": return VcRedist(p.DetectArg);
-                case "vc14":     return Vc14(p.DetectArg);
-                case "net35":    return Net35();
-                case "net48":    return Net48();
-                case "sharedfx": return SharedFx(p.DetectArg);
-                case "webview2": return WebView2();
-                case "java":     return Java(p.DetectArg);
-                case "xna":      return Xna(p.DetectArg);
-                case "vjsharp":  return VJSharp();
-                case "vsto":     return Vsto();
-                case "dllrepair": return DllRepair();
-            }
-            return new DetectResult(false, true, "未知");
-        }
-
-        /// <summary>
-        /// 系统运行库 DLL 体检：逐项检查 System32 / SysWOW64 里清单中的 DLL 是否齐全。
-        /// 检测阶段只比对文件是否存在（快），修复阶段才会去 WinSxS 找副本并补齐。
-        /// </summary>
-        private static DetectResult DllRepair()
-        {
-            List<DllIssue> issues = Sys.ScanRuntimeDlls(false);
-            int total = Sys.TotalChecks;
-
-            if (issues.Count == 0)
-                return new DetectResult(true, true, "全部正常（体检 " + total + " 项）");
-
-            return new DetectResult(false, true, "缺失 " + issues.Count + " 项（体检 " + total + " 项）");
-        }
-
-        /// <summary>按分组给出缺失统计文字，例如 "DirectX 组件 12，VC++ 运行库 8"。</summary>
-        internal static string GroupSummary(List<DllIssue> issues)
-        {
-            StringBuilder sb = new StringBuilder();
-            foreach (string g in DllCatalog.Groups())
-            {
-                int n = 0;
-                foreach (DllIssue it in issues) if (it.Group == g) n++;
-                if (n == 0) continue;
-                if (sb.Length > 0) sb.Append("，");
-                sb.Append(g).Append(" ").Append(n);
-            }
-            return sb.ToString();
-        }
-
-        /// <summary>检查系统目录中是否存在运行库关键 DLL。参数："x86|msvcr80.dll" / "both|d3dx9_43.dll"</summary>
-        private static DetectResult SystemFile(string arg)
-        {
-            string[] parts = arg.Split('|');
-            string arch = parts[0];
-            string file = parts[1];
-
-            bool found = false;
-            if (arch == "x86" || arch == "both")
-                found = File.Exists(Path.Combine(ArchDir(false), file));
-            if (!found && (arch == "x64" || arch == "both"))
-            {
-                if (!Environment.Is64BitOperatingSystem && arch == "x64") return new DetectResult(false, false, "不适用（32 位系统）");
-                found = File.Exists(Path.Combine(ArchDir(true), file));
-            }
-            return new DetectResult(found, true, found ? "已安装" : "未安装");
-        }
-
-        /// <summary>64 位系统上 x64 运行库在 System32、x86 运行库在 SysWOW64。</summary>
-        private static string ArchDir(bool x64)
-        {
-            return Sys.DirFor(x64);
-        }
-
-        /// <summary>
-        /// VC++ 2005 / 2008：在 Win10 / Win11 上，官方安装包只把运行库注册为 WinSxS
-        /// 并行程序集（x86_/amd64_microsoft.vc80.crt_* 等），并不会复制到
-        /// System32 / SysWOW64。只查系统目录会漏判，必须两处都查。
-        /// 参数："2005|x86" / "2008|x64"
-        /// </summary>
-        private static DetectResult VcRedist(string arg)
-        {
-            string[] parts = arg.Split('|');
-            string year = parts[0];
-            bool x64 = parts[1] == "x64";
-
-            if (x64 && !Environment.Is64BitOperatingSystem)
-                return new DetectResult(false, false, "不适用（32 位系统）");
-
-            string dll = (year == "2005") ? "msvcr80.dll" : "msvcr90.dll";
-            if (File.Exists(Path.Combine(ArchDir(x64), dll)))
-                return new DetectResult(true, true, "已安装");
-
-            string tag = (year == "2005") ? "vc80" : "vc90";
-            string prefix = (x64 ? "amd64" : "x86") + "_microsoft." + tag + ".crt_";
-            if (SxsAssemblyExists(prefix))
-                return new DetectResult(true, true, "已安装");
-
-            return new DetectResult(false, true, "未安装");
-        }
-
-        /// <summary>WinSxS 目录只枚举一次并缓存，避免逐项重复扫描上万个文件夹。</summary>
-        private static bool SxsAssemblyExists(string prefix)
-        {
-            foreach (string dir in Sys.SxsDirs())
-            {
-                string name = Path.GetFileName(dir);
-                if (name.Length >= prefix.Length
-                    && string.Compare(name, 0, prefix, 0, prefix.Length, true) == 0)
-                    return true;
-            }
-            return false;
-        }
-
-        /// <summary>VC++ 2015-2022 专用注册表项，带有精确版本号。</summary>
-        private static DetectResult Vc14(string arch)
-        {
-            string[] paths = new string[]
-            {
-                @"SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\" + arch,
-                @"SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\" + arch
-            };
-            foreach (string path in paths)
-            {
-                using (RegistryKey k = Registry.LocalMachine.OpenSubKey(path))
-                {
-                    if (k == null) continue;
-                    object inst = k.GetValue("Installed");
-                    if (inst != null && Convert.ToInt32(inst) == 1)
-                    {
-                        string v = k.GetValue("Version") as string;
-                        if (string.IsNullOrEmpty(v)) v = "已安装";
-                        return new DetectResult(true, true, v);
-                    }
-                }
-            }
-            return new DetectResult(false, true, "未安装");
-        }
-
-        private static DetectResult Net35()
-        {
-            using (RegistryKey k = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\NET Framework Setup\NDP\v3.5"))
-            {
-                if (k != null)
-                {
-                    object v = k.GetValue("Install");
-                    if (v != null && Convert.ToInt32(v) == 1)
-                        return new DetectResult(true, true, "已启用");
-                }
-            }
-            return new DetectResult(false, true, "未启用");
-        }
-
-        private static DetectResult Net48()
-        {
-            using (RegistryKey k = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full"))
-            {
-                if (k != null)
-                {
-                    object rv = k.GetValue("Release");
-                    if (rv != null)
-                    {
-                        int r = Convert.ToInt32(rv);
-                        string name = ReleaseName(r);
-                        if (r >= 528040) return new DetectResult(true, true, "已安装 " + name);
-                        return new DetectResult(false, true, "当前 " + name + "，低于 4.8");
-                    }
-                }
-            }
-            return new DetectResult(false, true, "未安装");
-        }
-
-        private static string ReleaseName(int r)
-        {
-            if (r >= 533320) return "4.8.1 或更高";
-            if (r >= 528040) return "4.8";
-            if (r >= 461808) return "4.7.2";
-            if (r >= 461308) return "4.7.1";
-            if (r >= 460798) return "4.7";
-            if (r >= 394802) return "4.6.2";
-            if (r >= 394254) return "4.6.1";
-            if (r >= 393295) return "4.6";
-            if (r >= 379893) return "4.5.2";
-            if (r >= 378675) return "4.5.1";
-            if (r >= 378389) return "4.5";
-            return "4.x";
-        }
-
-        /// <summary>.NET (Core) 共享框架，参数："Microsoft.WindowsDesktop.App|8" 或 "...|8|x86"</summary>
-        private static DetectResult SharedFx(string arg)
-        {
-            string[] parts = arg.Split('|');
-            string fx = parts[0];
-            string major = parts[1];
-            bool x86 = parts.Length > 2 && parts[2] == "x86";
-
-            string root = x86
-                ? Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86)
-                : Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-
-            string dir = Path.Combine(root, "dotnet", "shared", fx);
-            if (!Directory.Exists(dir)) return new DetectResult(false, true, "未安装");
-
-            string best = null;
-            foreach (string sub in Directory.GetDirectories(dir))
-            {
-                string n = Path.GetFileName(sub);
-                if (n.StartsWith(major + "."))
-                    if (best == null || string.CompareOrdinal(n, best) > 0) best = n;
-            }
-            if (best != null) return new DetectResult(true, true, "已安装 " + best);
-            return new DetectResult(false, true, "未安装");
-        }
-
-        private static DetectResult WebView2()
-        {
-            const string guid = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
-            string[] paths = new string[]
-            {
-                @"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\" + guid,
-                @"SOFTWARE\Microsoft\EdgeUpdate\Clients\" + guid
-            };
-            foreach (string path in paths)
-            {
-                using (RegistryKey k = Registry.LocalMachine.OpenSubKey(path))
-                {
-                    if (k == null) continue;
-                    object pv = k.GetValue("pv");
-                    if (pv != null && pv.ToString() != "0.0.0.0")
-                        return new DetectResult(true, true, "已安装 " + pv);
-                }
-            }
-            using (RegistryKey k = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\EdgeUpdate\Clients\" + guid))
-            {
-                if (k != null)
-                {
-                    object pv = k.GetValue("pv");
-                    if (pv != null && pv.ToString() != "0.0.0.0")
-                        return new DetectResult(true, true, "已安装 " + pv);
-                }
-            }
-            return new DetectResult(false, true, "未安装");
-        }
-
-        /// <summary>扫描 Temurin / Oracle 等厂商的注册表，匹配主版本号。</summary>
-        private static DetectResult Java(string major)
-        {
-            string[] roots = new string[]
-            {
-                @"SOFTWARE\Eclipse Adoptium\JRE",
-                @"SOFTWARE\WOW6432Node\Eclipse Adoptium\JRE",
-                @"SOFTWARE\JavaSoft\Java Runtime Environment",
-                @"SOFTWARE\WOW6432Node\JavaSoft\Java Runtime Environment",
-                @"SOFTWARE\JavaSoft\JRE",
-                @"SOFTWARE\WOW6432Node\JavaSoft\JRE"
-            };
-            foreach (string root in roots)
-            {
-                using (RegistryKey k = Registry.LocalMachine.OpenSubKey(root))
-                {
-                    if (k == null) continue;
-                    foreach (string ver in k.GetSubKeyNames())
-                        if (MajorOf(ver) == major)
-                            return new DetectResult(true, true, "已安装 " + ver);
-                }
-            }
-            return new DetectResult(false, true, "未安装");
-        }
-
-        private static string MajorOf(string ver)
-        {
-            if (ver.StartsWith("1.8")) return "8";
-            string[] p = ver.Split('.');
-            if (p.Length >= 2 && p[0] == "1") return p[1];
-            return p.Length >= 1 ? p[0] : ver;
-        }
-
-        /// <summary>XNA Framework：官方判据是 HKLM\Software\Microsoft\XNA\Framework\vX.Y\NativeLibraryPath。
-        /// 它是 32 位组件，64 位系统上落在 WOW6432Node，两个视图都要查。</summary>
-        private static DetectResult Xna(string ver)
-        {
-            string[] roots = new string[]
-            {
-                @"SOFTWARE\Microsoft\XNA\Framework\v" + ver,
-                @"SOFTWARE\WOW6432Node\Microsoft\XNA\Framework\v" + ver
-            };
-            foreach (string root in roots)
-            {
-                using (RegistryKey k = Registry.LocalMachine.OpenSubKey(root))
-                {
-                    if (k == null) continue;
-                    object v = k.GetValue("NativeLibraryPath");
-                    if (v != null && v.ToString().Length > 0)
-                        return new DetectResult(true, true, "已安装");
-                }
-            }
-            return new DetectResult(false, true, "未安装");
-        }
-
-        /// <summary>Visual J# 2.0：把类库 vjslib.dll 安装进 .NET Framework 2.0 目录，以此判定。</summary>
-        private static DetectResult VJSharp()
-        {
-            string net = Path.Combine(Sys.Windows, "Microsoft.NET");
-            string[] files = new string[]
-            {
-                Path.Combine(net, "Framework", "v2.0.50727", "vjslib.dll"),
-                Path.Combine(net, "Framework64", "v2.0.50727", "vjslib.dll")
-            };
-            foreach (string f in files)
-                if (File.Exists(f)) return new DetectResult(true, true, "已安装");
-            return new DetectResult(false, true, "未安装");
-        }
-
-        /// <summary>VSTO 4.0 运行时：注册表 HKLM\SOFTWARE\Microsoft\VSTO Runtime Setup\v4（或 v4R）。</summary>
-        private static DetectResult Vsto()
-        {
-            string[] roots = new string[]
-            {
-                @"SOFTWARE\Microsoft\VSTO Runtime Setup\v4",
-                @"SOFTWARE\Microsoft\VSTO Runtime Setup\v4R",
-                @"SOFTWARE\WOW6432Node\Microsoft\VSTO Runtime Setup\v4",
-                @"SOFTWARE\WOW6432Node\Microsoft\VSTO Runtime Setup\v4R"
-            };
-            foreach (string root in roots)
-            {
-                using (RegistryKey k = Registry.LocalMachine.OpenSubKey(root))
-                {
-                    if (k == null) continue;
-                    object v = k.GetValue("Version");
-                    if (v != null) return new DetectResult(true, true, "已安装 " + v);
-                }
-            }
-            return new DetectResult(false, true, "未安装");
-        }
-    }
-
-    // ======================= 下载与进程工具 =======================
-
-    internal static class Util
-    {
-        public static string WorkDir;
-
-        /// <summary>安装包存放目录：优先程序同目录的 packages（便于离线复用），不可写时退回临时目录。</summary>
-        public static string ResolveWorkDir()
-        {
-            try
-            {
-                string exeDir = Path.GetDirectoryName(Application.ExecutablePath);
-                string cand = Path.Combine(exeDir, "packages");
-                Directory.CreateDirectory(cand);
-                // 实际写一个文件验证权限
-                string probe = Path.Combine(cand, ".writetest");
-                File.WriteAllText(probe, "ok");
-                File.Delete(probe);
-                return cand;
-            }
-            catch
-            {
-                string tmp = Path.Combine(Path.GetTempPath(), "86运行库");
-                Directory.CreateDirectory(tmp);
-                return tmp;
-            }
-        }
-
-        public static void Download(string url, string dest, Action<int> onPercent, Func<bool> cancelled)
-        {
-            // 网络抖动是下载型工具的常见故障，最多自动重试 3 次
-            Exception last = null;
-            for (int attempt = 1; attempt <= 3; attempt++)
-            {
-                if (cancelled != null && cancelled()) throw new OperationCanceledException("用户取消");
-                try
-                {
-                    DownloadOnce(url, dest, onPercent, cancelled);
-                    return;
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    last = ex;
-                    if (attempt < 3) Thread.Sleep(1500);
-                }
-            }
-            throw new Exception("下载失败（已自动重试 3 次）："
-                + (last == null ? "未知错误" : last.Message), last);
-        }
-
-        private static void DownloadOnce(string url, string dest, Action<int> onPercent, Func<bool> cancelled)
-        {
-            try
-            {
-                // .NET Framework 4.x 默认可能不含 TLS 1.2，必须显式打开，否则 aka.ms / builds.dotnet 会握手失败
-                ServicePointManager.SecurityProtocol =
-                    SecurityProtocolType.Tls | (SecurityProtocolType)768 | (SecurityProtocolType)3072;
-            }
-            catch { }
-
-            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
-            req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
-            req.AllowAutoRedirect = true;
-            req.Timeout = 60000;
-            req.ReadWriteTimeout = 180000;
-
-            string part = dest + ".part";
-            try
-            {
-                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
-                {
-                    long total = resp.ContentLength;
-                    using (Stream rs = resp.GetResponseStream())
-                    using (FileStream fs = new FileStream(part, FileMode.Create, FileAccess.Write, FileShare.None, 65536))
-                    {
-                        byte[] buf = new byte[65536];
-                        long got = 0;
-                        int lastPct = -1;
-                        int n;
-                        while ((n = rs.Read(buf, 0, buf.Length)) > 0)
-                        {
-                            if (cancelled != null && cancelled()) throw new OperationCanceledException("用户取消");
-                            fs.Write(buf, 0, n);
-                            got += n;
-                            if (total > 0)
-                            {
-                                int pct = (int)(got * 100L / total);
-                                if (pct != lastPct)
-                                {
-                                    lastPct = pct;
-                                    if (onPercent != null) onPercent(pct);
-                                }
-                            }
-                        }
-                    }
-                }
-                if (File.Exists(dest)) File.Delete(dest);
-                File.Move(part, dest);
-            }
-            catch
-            {
-                try { if (File.Exists(part)) File.Delete(part); } catch { }
-                throw;
-            }
-        }
-
-        /// <summary>启动进程并等待结束，返回退出代码。</summary>
-        public static int RunExe(string file, string args)
-        {
-            return RunExe(file, args, null);
-        }
-
-        /// <summary>
-        /// 可取消的等待版本：cancelCheck 返回 true 时结束子进程并抛 OperationCanceledException。
-        /// 用于 DISM / sfc 这类可能占用十几分钟的长命令，保证界面上的"取消"真的有用。
-        /// </summary>
-        public static int RunExe(string file, string args, Func<bool> cancelCheck)
-        {
-            ProcessStartInfo psi = new ProcessStartInfo();
-            psi.FileName = file;
-            psi.Arguments = args;
-            psi.UseShellExecute = false;
-            psi.CreateNoWindow = true;
-
-            try
-            {
-                string wd = Path.GetDirectoryName(file);
-                if (!string.IsNullOrEmpty(wd) && Directory.Exists(wd)) psi.WorkingDirectory = wd;
-            }
-            catch { }
-
-            Process p = Process.Start(psi);
-            if (p == null) throw new Exception("无法启动进程：" + file);
-            using (p)
-            {
-                if (cancelCheck == null)
-                {
-                    p.WaitForExit();
-                    return p.ExitCode;
-                }
-                while (!p.WaitForExit(300))
-                {
-                    if (cancelCheck())
-                    {
-                        try { p.Kill(); } catch { }
-                        throw new OperationCanceledException();
-                    }
-                }
-                return p.ExitCode;
-            }
-        }
-    }
-
     // ======================= 主界面 =======================
 
     public class MainForm : Form
@@ -1076,7 +34,7 @@ namespace RunTimePack
         private Label lblStatus;
         private ToolTip tip;
         private CheckBox chkAllPages;
-        private Button btnInstall, btnAll, btnNone, btnInvert, btnMissing, btnRecommended, btnRescan, btnOpenDir;
+        private Button btnInstall, btnAll, btnNone, btnInvert, btnMissing, btnRecommended, btnRescan, btnOpenDir, btnExportLog;
         /// <summary>安装期间要临时禁用的工具栏按钮（防止用户误以为"点了没反应"）。</summary>
         private Button[] toolbarBtns;
         /// <summary>批量勾选（全选/反选等）进行中：此时不逐行写点击日志，避免刷屏。</summary>
@@ -1087,6 +45,11 @@ namespace RunTimePack
 
         private volatile bool busy;
         private volatile bool cancelFlag;
+        private volatile bool detecting;              // 检测进行中：防止 F5 / 连点按钮重入
+        private Thread installThread;                 // 进程内安装线程（关窗时等它真正结束）
+        private volatile bool installThreadFinished;
+        private int overallBase;                      // 总进度用：已完成任务数
+        private int overallCount;                     // 总进度用：任务总数
         private bool needReboot;
         private bool firstDetection = true;   // 只有首次检测才自动套用“推荐”勾选，避免覆盖用户的手动选择
 
@@ -1308,6 +271,7 @@ namespace RunTimePack
 
             btnRescan = MakeButton("重新检测(&D)", 106, delegate { RunDetection(); });
             btnOpenDir = MakeButton("打开安装包目录(&O)", 148, delegate { OpenWorkDir(); });
+            btnExportLog = MakeButton("导出日志(&E)", 106, delegate { ExportLog(); });
 
             toolbarBtns = new Button[] { btnAll, btnNone, btnInvert, btnMissing, btnRecommended, btnRescan };
 
@@ -1319,6 +283,7 @@ namespace RunTimePack
             toolbar.Controls.Add(chkAllPages);
             toolbar.Controls.Add(btnRescan);
             toolbar.Controls.Add(btnOpenDir);
+            toolbar.Controls.Add(btnExportLog);
 
             // ---- 运行库列表：按分类分成多页，便于按类型挑选 ----
             tabs = new TabControl();
@@ -1618,8 +583,21 @@ namespace RunTimePack
             }
             Ui(delegate
             {
-                log.AppendText(DateTime.Now.ToString("HH:mm:ss") + "  " + s + Environment.NewLine);
+                AppendLogText(DateTime.Now.ToString("HH:mm:ss") + "  " + s + Environment.NewLine);
             });
+        }
+
+        /// <summary>日志行数上限：超过后批量截掉最旧的行，避免长时间安装把文本框越拖越重。</summary>
+        private const int MaxLogLines = 2000;
+
+        private void AppendLogText(string text)
+        {
+            log.AppendText(text);
+            int lines = log.GetLineFromCharIndex(log.TextLength);
+            if (lines <= MaxLogLines) return;
+            int cut = lines - (MaxLogLines - 300);
+            int idx = log.GetFirstCharIndexFromLine(cut);
+            if (idx > 0) log.Text = log.Text.Substring(idx);
         }
 
         private void SetStatus(string s)
@@ -1767,45 +745,75 @@ namespace RunTimePack
             catch (Exception ex) { MessageBox.Show(this, "无法打开目录：\n" + ex.Message, "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         }
 
+        private void ExportLog()
+        {
+            using (SaveFileDialog dlg = new SaveFileDialog())
+            {
+                dlg.Title = "导出日志";
+                dlg.Filter = "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*";
+                dlg.FileName = "86运行库_日志_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".txt";
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                try
+                {
+                    File.WriteAllText(dlg.FileName, log.Text, new UTF8Encoding(true));
+                    Log("日志已导出：" + dlg.FileName);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, "导出失败：" + ex.Message, "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
+        }
+
         // ---------- 检测 ----------
 
         private void RunDetection()
         {
-            if (busy) return;
+            if (busy || detecting) return;
+            detecting = true;
             btnInstall.Enabled = false;
+            btnRescan.Enabled = false;
             SetStatus("正在检测本机已安装的运行库…");
             Log("开始检测本机运行库安装状态…");
 
             Thread t = new Thread(delegate()
             {
-                int installed = 0;
-                foreach (Pkg p in pkgs)
+                try
                 {
-                    DetectResult r = Detect.Run(p);
-                    p.Installed = r.Installed;
-                    p.Applicable = r.Applicable;
-                    p.StatusText = r.Text;
-                    if (r.Installed) installed++;
-                    UpdateItem(p);
+                    int installed = 0;
+                    foreach (Pkg p in pkgs)
+                    {
+                        DetectResult r = Detect.Run(p);
+                        p.Installed = r.Installed;
+                        p.Applicable = r.Applicable;
+                        p.StatusText = r.Text;
+                        if (r.Installed) installed++;
+                        UpdateItem(p);
+                    }
+
+                    int total = pkgs.Count;
+                    bool first = firstDetection;
+                    firstDetection = false;
+
+                    Ui(delegate
+                    {
+                        if (first) ApplyRecommended(true);
+                        btnInstall.Enabled = true;
+                        SetStatus("检测完成：共 " + total + " 项，本机已装 " + installed + " 项");
+                    });
+
+                    if (first)
+                        Log("检测完成：共 " + total + " 项，本机已装 " + installed
+                            + " 项。已默认勾选推荐的未安装项，可点“仅选推荐”恢复默认勾选。");
+                    else
+                        Log("检测完成：共 " + total + " 项，本机已装 " + installed + " 项。（勾选状态保持不变）");
+                    Log("");
                 }
-
-                int total = pkgs.Count;
-                bool first = firstDetection;
-                firstDetection = false;
-
-                Ui(delegate
+                finally
                 {
-                    if (first) ApplyRecommended(true);
-                    btnInstall.Enabled = true;
-                    SetStatus("检测完成：共 " + total + " 项，本机已装 " + installed + " 项");
-                });
-
-                if (first)
-                    Log("检测完成：共 " + total + " 项，本机已装 " + installed
-                        + " 项。已默认勾选推荐的未安装项，可点“仅选推荐”恢复默认勾选。");
-                else
-                    Log("检测完成：共 " + total + " 项，本机已装 " + installed + " 项。（勾选状态保持不变）");
-                Log("");
+                    detecting = false;
+                    Ui(delegate { btnRescan.Enabled = true; });
+                }
             });
             t.IsBackground = true;
             t.Start();
@@ -1869,7 +877,13 @@ namespace RunTimePack
             Log("当前已是管理员权限，直接在本进程内安装。");
             Log("");
             elevatedInstall = false;
-            Thread t = new Thread(delegate() { InstallWorker(selected); });
+            installThreadFinished = false;
+            Thread t = new Thread(delegate()
+            {
+                try { InstallWorker(selected); }
+                finally { installThreadFinished = true; }
+            });
+            installThread = t;
             t.IsBackground = true;
             t.Start();
         }
@@ -2011,7 +1025,7 @@ namespace RunTimePack
             string tag = line.Substring(0, 1);
             string body = line.Length > 2 ? line.Substring(2) : "";
 
-            if (tag == "L") { log.AppendText(body + Environment.NewLine); return; }
+            if (tag == "L") { AppendLogText(body + Environment.NewLine); return; }
             if (tag == "S") { lblStatus.Text = body; return; }
             if (tag == "P")
             {
@@ -2138,10 +1152,12 @@ namespace RunTimePack
                 Log("本次共 " + selected.Count + " 个任务。");
                 Log("");
 
+                overallCount = selected.Count;
                 for (int i = 0; i < selected.Count; i++)
                 {
                     Pkg p = selected[i];
                     if (cancelRequested) { Log("已被用户取消，停止后续任务。"); break; }
+                    overallBase = i;
 
                     SetStatus("(" + (i + 1) + "/" + selected.Count + ") " + p.Name);
                     Log("[" + (i + 1) + "/" + selected.Count + "] " + p.Name);
@@ -2231,23 +1247,9 @@ namespace RunTimePack
                 return;
             }
 
-            // --- 准备安装包（本地已有则直接复用，支持离线）---
+            // --- 准备安装包（本地已有则校验后复用，支持离线）---
             string file = Path.Combine(workDir, p.FileName);
-            bool cached = File.Exists(file) && new FileInfo(file).Length > 0;
-
-            if (cached)
-            {
-                Log("    使用已缓存的安装包：" + p.FileName);
-            }
-            else
-            {
-                Log("    下载：" + p.Url);
-                SetBar(0);
-                Util.Download(p.Url, file,
-                    delegate(int pct) { SetBar(pct); },
-                    delegate { return cancelRequested; });
-                Log("    下载完成：" + FmtMb(new FileInfo(file).Length));
-            }
+            EnsureCached(p, file);
 
             SetMarquee(true);
 
@@ -2286,16 +1288,81 @@ namespace RunTimePack
             else if (p.Kind == InstallKind.Msi)
             {
                 Log("    正在通过 msiexec 静默安装…");
-                HandleExitCode(p, Util.RunExe("msiexec.exe", "/i \"" + file + "\" " + p.Args,
-                    delegate { return cancelRequested; }));
+                string msiLog = "";
+                try
+                {
+                    string logDir = Path.Combine(workDir, "logs");
+                    Directory.CreateDirectory(logDir);
+                    msiLog = Path.Combine(logDir, Path.GetFileNameWithoutExtension(p.FileName) + ".msi.log");
+                }
+                catch { }
+                string msiArgs = "/i \"" + file + "\" " + p.Args;
+                if (msiLog.Length > 0) msiArgs += " /l*v \"" + msiLog + "\"";
+                try
+                {
+                    HandleExitCode(p, Util.RunExe("msiexec.exe", msiArgs,
+                        delegate { return cancelRequested; }));
+                }
+                catch
+                {
+                    if (msiLog.Length > 0) Log("    msiexec 详细日志：" + msiLog);
+                    throw;
+                }
             }
             else
             {
                 Log("    正在静默安装…");
                 HandleExitCode(p, Util.RunExe(file, p.Args, delegate { return cancelRequested; }));
             }
+        }
 
-            SetBar(0);
+        /// <summary>
+        /// 确保安装包就绪：本地缓存先校验 SHA-256（清单未给哈希的包跳过校验），
+        /// 缺失或不符则下载；下载完成后再校验一次，仍不符就删除重下一次。
+        /// </summary>
+        private void EnsureCached(Pkg p, string file)
+        {
+            bool cached = File.Exists(file) && new FileInfo(file).Length > 0;
+            if (cached && p.Sha256.Length > 0 && !Util.VerifySha256(file, p.Sha256))
+            {
+                Log("    缓存包 SHA-256 校验不符，将重新下载：" + p.FileName);
+                try { File.Delete(file); } catch { }
+                cached = false;
+            }
+            if (cached)
+            {
+                Log("    使用已缓存的安装包：" + p.FileName);
+                return;
+            }
+
+            Log("    下载：" + p.Url);
+            ReportItemProgress(0);
+            Util.Download(p.Url, file,
+                delegate(int pct) { ReportItemProgress(pct); },
+                delegate { return cancelRequested; });
+
+            if (p.Sha256.Length > 0 && !Util.VerifySha256(file, p.Sha256))
+            {
+                Log("    下载包 SHA-256 校验不符，删除后重新下载一次…");
+                try { File.Delete(file); } catch { }
+                ReportItemProgress(0);
+                Util.Download(p.Url, file,
+                    delegate(int pct) { ReportItemProgress(pct); },
+                    delegate { return cancelRequested; });
+                if (!Util.VerifySha256(file, p.Sha256))
+                {
+                    try { File.Delete(file); } catch { }
+                    throw new Exception("安装包 SHA-256 校验失败：" + p.FileName);
+                }
+            }
+            Log("    下载完成：" + FmtMb(new FileInfo(file).Length));
+        }
+
+        /// <summary>把当前项的下载百分比换算成总进度上报：(已完成项 + 当前项进度) / 总项数。</summary>
+        private void ReportItemProgress(int pct)
+        {
+            if (overallCount <= 0) { SetBar(pct); return; }
+            SetBar((int)((overallBase * 100.0 + pct) / overallCount));
         }
 
         /// <summary>
@@ -2408,14 +1475,16 @@ namespace RunTimePack
                 + "自动安装运行库 " + installedPkgs + " 个，复制失败 " + copyFail + " 项）。");
 
             if (after.Count == 0)
+            {
                 Log("    复检结果：清单内 " + total + " 项 DLL 现已全部正常。");
+            }
             else
+            {
                 Log("    复检结果：仍有 " + after.Count + " 项缺失 —— " + Detect.GroupSummary(after));
                 foreach (DllIssue it in after)
                     Log("      [" + it.ArchText + "] " + it.Name
                         + (it.Source == null ? "（本机与官方运行库均不提供此文件）" : "（本机系统组件里有副本，但复制未成功）"));
-
-            SetBar(0);
+            }
         }
 
         /// <summary>
@@ -2629,16 +1698,15 @@ namespace RunTimePack
             Log("        Windows 更新组件缓存已重建（原目录改名备份，未删除）");
         }
 
-        /// <summary>把目录改名为 .bak（可随时改回），失败只记录、不中断流程。</summary>
+        /// <summary>把目录改名为带时间戳的 .bak_（旧备份绝不删除，可随时改回），失败只记录、不中断流程。</summary>
         private void RenameAsBackup(string dir)
         {
             try
             {
                 if (!Directory.Exists(dir)) return;
-                string bak = dir + ".bak";
-                if (Directory.Exists(bak)) Directory.Delete(bak, true);
+                string bak = dir + ".bak_" + DateTime.Now.ToString("yyyyMMdd_HHmmss");
                 Directory.Move(dir, bak);
-                Log("        已重置：" + dir);
+                Log("        已重置：" + dir + "（原目录改名为 " + Path.GetFileName(bak) + "，未删除）");
             }
             catch (Exception ex)
             {
@@ -2835,14 +1903,7 @@ namespace RunTimePack
             if (already && p.RepairArgs != null)
             {
                 string file = Path.Combine(workDir, p.FileName);
-                if (!File.Exists(file) || new FileInfo(file).Length == 0)
-                {
-                    Log("    下载（供修复使用）：" + p.Url);
-                    SetBar(0);
-                    Util.Download(p.Url, file,
-                        delegate(int pct) { SetBar(pct); },
-                        delegate { return cancelRequested; });
-                }
+                EnsureCached(p, file);
                 Log("    运行库已在本机，改用修复模式还原缺失文件：" + p.RepairArgs
                     + "（注意：安装包只会还原它自己带有的文件，包内没有的文件仍旧不会出现）");
                 SetMarquee(true);
@@ -2872,6 +1933,8 @@ namespace RunTimePack
                 case 1605:  // 产品未安装
                     Log("    系统报告该产品未安装（返回码 1605）。");
                     return;
+                case 1618:  // ERROR_INSTALL_ALREADY_RUNNING
+                    throw new Exception("另一个安装正在进行（错误代码 1618），请等它结束后重试本项。");
             }
             throw new Exception("安装程序返回错误代码 " + rc + "（0x" + ((uint)rc).ToString("X8") + "）");
         }
@@ -2886,6 +1949,21 @@ namespace RunTimePack
                 return;
             }
             cancelRequested = true;
+
+            if (!elevatedInstall)
+            {
+                // 进程内安装：直接退出会腰斩 msiexec 子进程，留下装了一半的运行库。
+                // 先请求取消，再等安装线程真正结束（最多 30 秒）才放行关闭。
+                int waited = 0;
+                while (!installThreadFinished && waited < 30000)
+                {
+                    Thread.Sleep(100);
+                    waited += 100;
+                }
+                if (!installThreadFinished)
+                    Log("等待安装线程结束超时，仍将退出（当前安装步骤可能被打断）。");
+                return;
+            }
 
             if (elevatedInstall)
             {
@@ -2907,207 +1985,4 @@ namespace RunTimePack
         }
     }
 
-    // ======================= 程序入口 =======================
-
-    /// <summary>
-    /// 任务文件 / 状态文件读写（界面进程 ↔ 提权工作进程之间唯一的通信通道）。
-    /// 任务文件由界面写、工作进程读；状态文件由工作进程追加、界面轮询读取。
-    /// </summary>
-    internal static class TaskFile
-    {
-        private static readonly object gate = new object();
-
-        public static string StatusPath(string task) { return task + ".status"; }
-        public static string CancelPath(string task) { return task + ".cancel"; }
-
-        /// <summary>追加一行。文件被界面删除或正在读取时都不能影响安装，所以异常一律吞掉。</summary>
-        public static void WriteLine(string path, string line)
-        {
-            if (string.IsNullOrEmpty(path)) return;
-            try
-            {
-                lock (gate)
-                {
-                    using (FileStream fs = new FileStream(path, FileMode.Append,
-                               FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
-                    using (StreamWriter w = new StreamWriter(fs, new UTF8Encoding(false)))
-                    {
-                        w.WriteLine(line);
-                        w.Flush();
-                    }
-                }
-            }
-            catch { }
-        }
-
-        /// <summary>读取任务文件里 "key=value" 形式的某一项。</summary>
-        public static string ReadValue(string taskFile, string key)
-        {
-            try
-            {
-                foreach (string raw in File.ReadAllLines(taskFile, Encoding.UTF8))
-                {
-                    string s = raw.Trim();
-                    int eq = s.IndexOf('=');
-                    if (eq <= 0) continue;
-                    if (string.Equals(s.Substring(0, eq), key, StringComparison.OrdinalIgnoreCase))
-                        return s.Substring(eq + 1);
-                }
-            }
-            catch { }
-            return null;
-        }
-
-        /// <summary>读取任务文件里的条目序号列表。</summary>
-        public static List<int> ReadIndices(string taskFile)
-        {
-            List<int> r = new List<int>();
-            string v = ReadValue(taskFile, "index");
-            if (string.IsNullOrEmpty(v)) return r;
-            foreach (string part in v.Split(','))
-            {
-                int i;
-                if (int.TryParse(part.Trim(), out i)) r.Add(i);
-            }
-            return r;
-        }
-    }
-
-    internal static class Program
-    {
-        [STAThread]
-        private static void Main(string[] args)
-        {
-            // 自检模式：不显示界面，仅输出检测结果，便于部署前核对
-            if (args.Length > 0 && string.Equals(args[0], "/selftest", StringComparison.OrdinalIgnoreCase))
-            {
-                string outFile = args.Length > 1
-                    ? args[1]
-                    : Path.Combine(Path.GetTempPath(), "86运行库_selftest.txt");
-                SelfTest(outFile);
-                return;
-            }
-
-            // 工作进程模式：由界面进程用 runas 以管理员身份拉起，没有界面，只执行安装。
-            if (args.Length >= 2 && string.Equals(args[0], "--worker", StringComparison.OrdinalIgnoreCase))
-            {
-                string taskFile = args[1];
-                int rc = 0;
-                try
-                {
-                    Util.WorkDir = Util.ResolveWorkDir();
-                    MainForm w = new MainForm(taskFile);
-                    rc = w.RunHeadless();
-                }
-                catch (Exception ex)
-                {
-                    try
-                    {
-                        TaskFile.WriteLine(TaskFile.StatusPath(taskFile),
-                            "F\t" + (ex == null ? "未知错误" : ex.Message));
-                    }
-                    catch { }
-                    rc = 1;
-                }
-                Environment.Exit(rc);
-                return;
-            }
-
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
-
-            // 兜底：界面线程上的任何未捕获异常都转成中文提示 + 错误报告文件，
-            // 而不是弹出 .NET 那个看不懂的 JIT 崩溃对话框。
-            Application.ThreadException += delegate(object s, ThreadExceptionEventArgs e)
-            {
-                ReportCrash(e.Exception);
-            };
-            AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e)
-            {
-                ReportCrash(e.ExceptionObject as Exception);
-            };
-
-            try
-            {
-                Util.WorkDir = Util.ResolveWorkDir();
-                Application.Run(new MainForm());
-            }
-            catch (Exception ex)
-            {
-                ReportCrash(ex);
-            }
-        }
-
-        /// <summary>把异常写成一份可读的报告文件并提示用户，避免直接崩掉。</summary>
-        private static void ReportCrash(Exception ex)
-        {
-            string text = ex == null ? "未知错误" : ex.ToString();
-            try
-            {
-                string file = Path.Combine(Path.GetTempPath(), "86运行库_错误报告.txt");
-                File.WriteAllText(file, "86运行库 错误报告 " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
-                    + Environment.NewLine + Environment.NewLine + text, Encoding.UTF8);
-                MessageBox.Show("程序遇到未预期的错误，详情已记录到：\n" + file + "\n\n"
-                    + (ex == null ? "" : ex.Message), "86运行库", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-            catch
-            {
-                MessageBox.Show(text, "86运行库", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
-
-        private static void SelfTest(string outFile)
-        {
-            StringBuilder sb = new StringBuilder();
-            sb.AppendLine("86 运行库 — 自检报告");
-            sb.AppendLine("时间：" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
-            sb.AppendLine("系统：" + Environment.OSVersion.VersionString
-                          + "　" + (Environment.Is64BitOperatingSystem ? "64 位" : "32 位"));
-            sb.AppendLine("安装包目录：" + Util.ResolveWorkDir());
-            sb.AppendLine();
-
-            List<Pkg> pkgs = Catalog.Build();
-            sb.AppendLine("清单共 " + pkgs.Count + " 项：");
-            sb.AppendLine(new string('-', 100));
-
-            string lastCat = null;
-            int installed = 0, missing = 0, na = 0;
-            foreach (Pkg p in pkgs)
-            {
-                if (p.Category != lastCat)
-                {
-                    lastCat = p.Category;
-                    sb.AppendLine();
-                    sb.AppendLine("【" + lastCat + "】");
-                }
-
-                DetectResult r = Detect.Run(p);
-                if (!r.Applicable) na++;
-                else if (r.Installed) installed++;
-                else missing++;
-
-                sb.AppendLine(string.Format("  {0,-40} {1,-24} {2,-22} {3}",
-                    p.Name, p.Note, r.Text, r.Applicable ? "" : "[不适用]"));
-            }
-
-            sb.AppendLine();
-            sb.AppendLine(new string('-', 100));
-            sb.AppendLine("已安装 " + installed + " 项，未安装 " + missing + " 项，不适用 " + na + " 项。");
-
-            // 运行库 DLL 体检明细：逐项列出缺失的 DLL 及其可否就地补齐
-            List<DllIssue> issues = Sys.ScanRuntimeDlls(true);
-            sb.AppendLine();
-            sb.AppendLine("【系统运行库 DLL 体检】清单 " + DllCatalog.Items.Count + " 种，共 "
-                          + Sys.TotalChecks + " 项，缺失 " + issues.Count + " 项。");
-            foreach (DllIssue it in issues)
-            {
-                sb.AppendLine("  缺 [" + it.ArchText + "] " + it.Name + "　[" + it.Group + "]　"
-                              + (it.Source != null
-                                 ? "可从本机系统组件就地补齐"
-                                 : "需安装归属运行库：" + (it.Owner != null ? it.Owner : "无（只能靠其它副本）")));
-            }
-
-            File.WriteAllText(outFile, sb.ToString(), Encoding.UTF8);
-        }
-    }
 }

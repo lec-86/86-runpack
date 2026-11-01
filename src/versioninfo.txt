@@ -1,0 +1,15 @@
+# ============================================================================
+#  86 运行库 - 版本信息（key=value 格式，UTF-8 编码）
+#  由 src\setver.ps1 读取并注入到编译产物 exe 的 VERSIONINFO 资源里。
+#  （Windows 自带的旧版 csc.exe 不支持 /win32versionresource，只能事后注入。）
+# ============================================================================
+FILEVERSION=1.0.0.0
+PRODUCTVERSION=1.0.0.0
+CompanyName=86
+FileDescription=86运行库 - Windows 运行库一键检测与静默安装工具
+FileVersion=1.0.0.0
+InternalName=RunTimePack
+LegalCopyright=免费软件，可自由分发使用
+OriginalFilename=86RunPack.exe
+ProductName=86运行库
+ProductVersion=1.0.0.0

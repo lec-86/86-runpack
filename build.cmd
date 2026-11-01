@@ -34,7 +34,7 @@ set "TMPOUT=%~dp0_build_out.exe"
     /reference:System.Drawing.dll ^
     /reference:System.Windows.Forms.dll ^
     /reference:System.IO.Compression.FileSystem.dll ^
-    "%~dp0src\RunTimePack.cs"
+    "%~dp0src\*.cs"
 
 if errorlevel 1 (
     echo.
@@ -43,6 +43,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem ---- Inject VERSIONINFO resource (legacy csc has no /win32versionresource) ----
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\setver.ps1" "%TMPOUT%" "%~dp0src\versioninfo.txt"
+
 powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $dir='%~dp0'; $n=[IO.File]::ReadAllText($dir+'src\appname.txt',[Text.Encoding]::UTF8).Trim(); $out=Join-Path $dir ($n+'.exe'); if(Test-Path -LiteralPath $out){Remove-Item -LiteralPath $out -Force}; [IO.File]::Move($dir+'_build_out.exe',$out); Write-Host ''; Write-Host ('[DONE] ' + $out)"
 
 if errorlevel 1 (
@@ -50,6 +53,19 @@ if errorlevel 1 (
     echo [FAILED] Could not rename the output to the product name.
     pause
     exit /b 1
+)
+
+rem ---- Sync sources into the github repo copy (pure ASCII commands) ----
+if exist "%~dp0github\" (
+    del /Q "%~dp0github\src\*.cs" >nul 2>&1
+    xcopy /Y /I "%~dp0src\*.cs" "%~dp0github\src\" >nul
+    xcopy /Y "%~dp0src\app.manifest" "%~dp0github\src\" >nul
+    xcopy /Y "%~dp0src\app.ico" "%~dp0github\src\" >nul
+    xcopy /Y "%~dp0src\appname.txt" "%~dp0github\src\" >nul
+    xcopy /Y "%~dp0src\versioninfo.txt" "%~dp0github\src\" >nul
+    xcopy /Y "%~dp0src\setver.ps1" "%~dp0github\src\" >nul
+    xcopy /Y "%~dp0build.cmd" "%~dp0github\" >nul
+    echo [SYNC] Sources copied to github\src
 )
 
 echo.
